@@ -1,0 +1,8 @@
+# LyricFuse dependencies
+# Python 3.9 - 3.11 recommended (WhisperX compatibility)
+
+streamlit>=1.28.0
+whisperx>=3.1.1
+torch>=2.0.0
+torchaudio>=2.0.0
+ffmpeg-python>=0.2.0

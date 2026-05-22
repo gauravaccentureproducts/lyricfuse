@@ -369,62 +369,122 @@ async function extractAudio(ffmpeg, videoBytes, subProgress) {
 // ===================================================================
 // Step 2: decode WAV bytes -> Float32Array (mono, 16 kHz) for Whisper
 //
-// Why this is non-trivial:
-//   - `new AudioContext({ sampleRate: 16000 })` throws/ignores on Safari and
-//     some mobile Chrome versions, silently falling back to 44.1/48 kHz.
-//   - If we hand non-16 kHz audio to Whisper, it misinterprets duration and
-//     produces garbage word timestamps (or hangs).
-//   - Solution: decode at the context's native rate, then explicitly resample
-//     to 16 kHz mono using an OfflineAudioContext (which always honors its
-//     target sample rate).
+// We control the producer: FFmpeg was invoked with
+//   `-acodec pcm_s16le -ar 16000 -ac 1`
+// so the WAV is GUARANTEED to be 16 kHz, mono, 16-bit little-endian PCM.
+// Parsing it directly is faster, deterministic, and — critically — has no
+// dependency on AudioContext, which on mobile Chrome has been observed to
+// hang indefinitely when the context is created in a suspended state.
+//
+// We still fall back to AudioContext if the WAV header somehow comes back
+// with unexpected parameters (FFmpeg version drift, etc.) — but that path
+// should never trigger in normal use.
 // ===================================================================
 async function decodeWavToFloat32(wavBytes, subProgress) {
-  if (subProgress) subProgress(0.0, "creating audio context");
-  const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC) throw new Error("This browser does not support the Web Audio API.");
-  const ctx = new AC();
+  if (subProgress) subProgress(0.0, "parsing WAV header");
 
-  if (subProgress) subProgress(0.10, "preparing buffer");
-  // decodeAudioData wants a real ArrayBuffer slice (not a SharedArrayBuffer view).
-  const ab = wavBytes.buffer.slice(
-    wavBytes.byteOffset,
-    wavBytes.byteOffset + wavBytes.byteLength
-  );
-
-  if (subProgress) subProgress(0.25, "decoding PCM samples");
-  let decoded;
-  try {
-    decoded = await ctx.decodeAudioData(ab);
-  } catch (e) {
-    throw new Error("Could not decode the extracted WAV audio. " + (e.message || e));
-  } finally {
-    if (ctx.close) ctx.close().catch(() => {});
+  // RIFF/WAVE header walk. Layout reference: http://soundfile.sapp.org/doc/WaveFormat/
+  const dv = new DataView(wavBytes.buffer, wavBytes.byteOffset, wavBytes.byteLength);
+  if (dv.byteLength < 44) {
+    throw new Error(`WAV file too short to contain a header (${dv.byteLength} bytes).`);
   }
+  // "RIFF" + size + "WAVE"
+  if (dv.getUint32(0,  false) !== 0x52494646) throw new Error("Not a RIFF file (missing 'RIFF' magic).");
+  if (dv.getUint32(8,  false) !== 0x57415645) throw new Error("Not a WAVE file (missing 'WAVE' magic).");
 
-  // Fast path: already exactly what Whisper wants.
-  if (decoded.sampleRate === 16000 && decoded.numberOfChannels === 1) {
-    if (subProgress) subProgress(1.0, `${decoded.duration.toFixed(1)}s ready (native 16 kHz)`);
-    return decoded.getChannelData(0);
+  let offset = 12;
+  let audioFormat = 0, numChannels = 0, sampleRate = 0, bitsPerSample = 0;
+  let dataOffset = 0, dataSize = 0;
+
+  // Walk sub-chunks. Most WAVs have 'fmt ' then 'data', but some encoders
+  // insert 'LIST' / 'JUNK' / 'fact' in between — we skip whatever we don't know.
+  while (offset <= dv.byteLength - 8) {
+    const id   = dv.getUint32(offset,     false);
+    const size = dv.getUint32(offset + 4, true);
+    if (id === 0x666d7420 /* 'fmt ' */) {
+      audioFormat   = dv.getUint16(offset + 8,  true);
+      numChannels   = dv.getUint16(offset + 10, true);
+      sampleRate    = dv.getUint32(offset + 12, true);
+      bitsPerSample = dv.getUint16(offset + 22, true);
+    } else if (id === 0x64617461 /* 'data' */) {
+      dataOffset = offset + 8;
+      dataSize   = size;
+      break;
+    }
+    // Chunks are word-aligned: round up to even length.
+    offset += 8 + size + (size & 1);
   }
+  if (!dataOffset) throw new Error("WAV file has no 'data' chunk.");
 
   if (subProgress) {
-    subProgress(
-      0.55,
-      `resampling ${decoded.sampleRate} Hz → 16000 Hz` +
-      (decoded.numberOfChannels > 1 ? ", downmix to mono" : "")
-    );
+    subProgress(0.2, `${sampleRate} Hz, ${numChannels}ch, ${bitsPerSample}-bit, ${(dataSize / 1024 / 1024).toFixed(1)} MB`);
   }
-  // Resample to 16 kHz mono via OfflineAudioContext (always honors its
-  // declared sampleRate; auto-downmixes when the destination has 1 channel).
-  const targetRate = 16000;
-  const targetLen = Math.max(1, Math.ceil(decoded.duration * targetRate));
-  const offline = new OfflineAudioContext(1, targetLen, targetRate);
+
+  // Fast path: 16-bit PCM, mono, 16 kHz — exactly what FFmpeg gave us and
+  // exactly what Whisper wants. Convert int16 -> float32 in [-1, 1].
+  const FORMAT_PCM = 1;
+  if (audioFormat === FORMAT_PCM && bitsPerSample === 16 && numChannels === 1 && sampleRate === 16000) {
+    const numSamples = (dataSize / 2) | 0;
+    const out = new Float32Array(numSamples);
+    // Yield control to the UI periodically so the progress bar can repaint.
+    const CHUNK = 1 << 18; // 262 144 samples per yield ≈ 16 s of 16 kHz
+    let written = 0;
+    while (written < numSamples) {
+      const end = Math.min(written + CHUNK, numSamples);
+      for (let i = written; i < end; i++) {
+        out[i] = dv.getInt16(dataOffset + i * 2, true) / 32768;
+      }
+      written = end;
+      if (subProgress) {
+        subProgress(0.2 + 0.8 * (written / numSamples),
+          `${(written / 16000).toFixed(0)}s / ${(numSamples / 16000).toFixed(0)}s converted`);
+      }
+      // Yield to event loop so the UI can paint the new %.
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    if (subProgress) subProgress(1.0, `${(numSamples / 16000).toFixed(1)}s ready`);
+    return out;
+  }
+
+  // Slow path: unexpected format (shouldn't happen with our FFmpeg call,
+  // but degrade gracefully). Use AudioContext + OfflineAudioContext.
+  console.warn(
+    "[decodeWav] Unexpected WAV params, falling back to AudioContext.",
+    { audioFormat, numChannels, sampleRate, bitsPerSample }
+  );
+  if (subProgress) subProgress(0.25, "unexpected format — using AudioContext fallback");
+  return await decodeWavFallback(wavBytes, subProgress);
+}
+
+async function decodeWavFallback(wavBytes, subProgress) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) throw new Error("Browser lacks Web Audio API and WAV format was non-standard.");
+  const ctx = new AC();
+  if (ctx.state === "suspended" && ctx.resume) {
+    try { await ctx.resume(); } catch { /* best effort */ }
+  }
+  const ab = wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength);
+  // Race decodeAudioData against a timeout so we surface the hang instead of
+  // sitting there for 30 minutes.
+  const decoded = await Promise.race([
+    ctx.decodeAudioData(ab),
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("AudioContext.decodeAudioData hung for 60s — aborting.")), 60000)
+    ),
+  ]);
+  if (ctx.close) ctx.close().catch(() => {});
+
+  if (decoded.sampleRate === 16000 && decoded.numberOfChannels === 1) {
+    return decoded.getChannelData(0);
+  }
+  if (subProgress) subProgress(0.6, `resampling ${decoded.sampleRate} Hz → 16000 Hz`);
+  const targetLen = Math.max(1, Math.ceil(decoded.duration * 16000));
+  const offline = new OfflineAudioContext(1, targetLen, 16000);
   const src = offline.createBufferSource();
   src.buffer = decoded;
   src.connect(offline.destination);
   src.start(0);
   const resampled = await offline.startRendering();
-  if (subProgress) subProgress(1.0, `${decoded.duration.toFixed(1)}s ready`);
   return resampled.getChannelData(0);
 }
 

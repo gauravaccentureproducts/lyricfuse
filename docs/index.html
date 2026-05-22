@@ -6,8 +6,10 @@
   <title>LyricFuse — Burn lyrics onto any video</title>
   <meta name="description" content="Browser-only forced-alignment tool: drop a video, paste lyrics, get a video with subtitles burned in. 100% client-side." />
   <link rel="stylesheet" href="styles.css" />
-  <!-- Cross-origin isolation polyfill (required for SharedArrayBuffer / ffmpeg.wasm on GitHub Pages) -->
-  <script src="coi-serviceworker.js"></script>
+  <!-- Note: We use single-threaded ffmpeg.wasm core, so SharedArrayBuffer is
+       NOT required. The COI service worker is left in the repo for a future
+       upgrade to @ffmpeg/core-mt but is NOT loaded here (it triggers an
+       auto-reload that misbehaves on some mobile browsers). -->
 </head>
 <body>
   <header class="hero">

@@ -6,7 +6,7 @@
   <title>LyricFuse — Burn lyrics onto any video</title>
   <meta name="description" content="Browser-only forced-alignment tool: drop a video, paste lyrics, get a video with subtitles burned in. 100% client-side." />
   <!-- Cache-bust on every meaningful change; phones aggressively cache. -->
-  <link rel="stylesheet" href="styles.css?v=20260523c" />
+  <link rel="stylesheet" href="styles.css?v=20260523d" />
   <!-- Note: We use single-threaded ffmpeg.wasm core, so SharedArrayBuffer is
        NOT required. The COI service worker is left in the repo for a future
        upgrade to @ffmpeg/core-mt but is NOT loaded here (it triggers an
@@ -143,6 +143,6 @@
 
   <!-- Main app logic (module so it can use ES imports for transformers.js / ffmpeg).
        Cache-bust query: bump this whenever app.js changes substantively. -->
-  <script type="module" src="app.js?v=20260523c"></script>
+  <script type="module" src="app.js?v=20260523d"></script>
 </body>
 </html>

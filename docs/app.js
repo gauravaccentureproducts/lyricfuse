@@ -66,6 +66,9 @@ const state = {
 const $ = (id) => document.getElementById(id);
 
 const els = {
+  // Keepalive banner (top of body, shared across stages)
+  keepaliveBanner: $("keepalive-banner"),
+
   // Stage 1
   stageInput: $("stage-input"),
   dropZone: $("drop-zone"),
@@ -100,6 +103,96 @@ const els = {
   dlSrt: $("dl-srt"),
   btnRestart: $("btn-restart"),
 };
+
+// ===================================================================
+// Tab keep-alive: best-effort defense against mobile suspending us.
+//
+// Honest limits — read before believing any of this is magic:
+//   * Wake Lock keeps the SCREEN on. If the user switches to another
+//     app or hits the home button, the tab still gets backgrounded and
+//     mobile Chrome will throttle/suspend us regardless. Wake Lock just
+//     prevents the screen timing out while LyricFuse is foreground.
+//   * The silent-audio hack used to keep tabs alive on backgrounding
+//     (Chrome treats playing audio as "active"). Modern Chrome detects
+//     inaudible audio and ignores it for foreground heuristics — so
+//     this is genuinely best-effort. Costs nothing to try; sometimes
+//     buys you a few extra minutes.
+//   * The visibilitychange listener re-acquires Wake Lock when the
+//     user comes back, which is the one place it really helps: the
+//     OS releases the lock when the tab is hidden, and won't auto-renew.
+// ===================================================================
+const keepalive = (() => {
+  let wakeLock = null;
+  let silentAudio = null;
+  let active = false;
+
+  async function acquireWakeLock() {
+    if (!("wakeLock" in navigator)) return;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => {
+        console.info("[keepalive] wake lock released by system");
+        wakeLock = null;
+      });
+      console.info("[keepalive] wake lock acquired");
+    } catch (e) {
+      // Common reason: page not focused, or feature gated by user setting.
+      console.warn("[keepalive] wake lock request failed:", e.message);
+    }
+  }
+
+  function startSilentAudio() {
+    if (silentAudio) return;
+    // 1-second silent WAV (16 kHz, mono, 16-bit). Inline base64 = tiny.
+    // We loop it via the HTMLAudioElement, which mobile media policies
+    // treat as media playback and (in some cases) refuse to suspend.
+    const SILENT_WAV =
+      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+    try {
+      const a = new Audio(SILENT_WAV);
+      a.loop = true;
+      a.volume = 0.001;  // not audible but still "playing"
+      a.play().catch((e) => console.warn("[keepalive] silent audio blocked:", e.message));
+      silentAudio = a;
+    } catch (e) {
+      console.warn("[keepalive] could not start silent audio:", e.message);
+    }
+  }
+
+  function stopSilentAudio() {
+    if (!silentAudio) return;
+    try { silentAudio.pause(); } catch {}
+    silentAudio.src = "";
+    silentAudio = null;
+  }
+
+  // When the user comes back from another tab, Wake Lock is gone — re-acquire.
+  document.addEventListener("visibilitychange", async () => {
+    if (active && document.visibilityState === "visible" && !wakeLock) {
+      await acquireWakeLock();
+    }
+  });
+
+  return {
+    async start() {
+      if (active) return;
+      active = true;
+      els.keepaliveBanner.classList.remove("hidden");
+      await acquireWakeLock();
+      startSilentAudio();
+    },
+    async stop() {
+      if (!active) return;
+      active = false;
+      els.keepaliveBanner.classList.add("hidden");
+      stopSilentAudio();
+      if (wakeLock) {
+        try { await wakeLock.release(); } catch {}
+        wakeLock = null;
+      }
+    },
+  };
+})();
 
 // ===================================================================
 // UI helpers
@@ -686,6 +779,7 @@ async function burnSubtitles(ffmpeg, videoBytes, srtText, subProgress) {
 async function handleAnalyze() {
   clearError();
   els.btnAnalyze.disabled = true;
+  await keepalive.start();
 
   // Build a single progress updater bound to the analyze UI nodes, then
   // carve it into named sub-ranges per pipeline phase. The width of each
@@ -762,6 +856,8 @@ async function handleAnalyze() {
     wrapped.stack = err.stack;
     showError(wrapped);
     els.btnAnalyze.disabled = false;
+  } finally {
+    await keepalive.stop();
   }
 }
 
@@ -790,6 +886,7 @@ function escapeHtml(s) {
 
 async function handleGenerate() {
   els.btnGenerate.disabled = true;
+  await keepalive.start();
   const progress = makeProgressUpdater(
     els.burnProgressArea, els.burnProgressFill, els.burnProgressPct, els.burnProgressStatus
   );
@@ -831,6 +928,8 @@ async function handleGenerate() {
     wrapped.stack = err.stack;
     showError(wrapped);
     els.btnGenerate.disabled = false;
+  } finally {
+    await keepalive.stop();
   }
 }
 

@@ -6,7 +6,7 @@
   <title>LyricFuse — Burn lyrics onto any video</title>
   <meta name="description" content="Browser-only forced-alignment tool: drop a video, paste lyrics, get a video with subtitles burned in. 100% client-side." />
   <!-- Cache-bust on every meaningful change; phones aggressively cache. -->
-  <link rel="stylesheet" href="styles.css?v=20260523d" />
+  <link rel="stylesheet" href="styles.css?v=20260523e" />
   <!-- Note: We use single-threaded ffmpeg.wasm core, so SharedArrayBuffer is
        NOT required. The COI service worker is left in the repo for a future
        upgrade to @ffmpeg/core-mt but is NOT loaded here (it triggers an
@@ -18,6 +18,16 @@
     <p class="tagline">Fuse lyrics onto a video — exactly on time, line by line.</p>
     <p class="subtitle">Runs entirely in your browser. Nothing uploaded to any server.</p>
   </header>
+
+  <!-- Shown only during processing. Wake Lock will keep the screen on, but
+       app-switching may still suspend the tab — so we warn explicitly. -->
+  <div id="keepalive-banner" class="keepalive-banner hidden" role="status" aria-live="polite">
+    <span class="keepalive-icon">⚡</span>
+    <span class="keepalive-text">
+      <strong>Keep this tab in front while it processes.</strong>
+      Screen-stay-awake is on, but switching apps (or locking the phone) will pause and may reset progress.
+    </span>
+  </div>
 
   <main>
     <!-- ================================================================ -->
@@ -143,6 +153,6 @@
 
   <!-- Main app logic (module so it can use ES imports for transformers.js / ffmpeg).
        Cache-bust query: bump this whenever app.js changes substantively. -->
-  <script type="module" src="app.js?v=20260523d"></script>
+  <script type="module" src="app.js?v=20260523e"></script>
 </body>
 </html>

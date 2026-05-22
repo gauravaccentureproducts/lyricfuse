@@ -244,6 +244,26 @@ textarea:focus, select:focus { outline: none; border-color: var(--primary); }
   text-align: left;
 }
 
+/* ---------- Keepalive banner (during processing) ---------- */
+.keepalive-banner {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  margin: 0 auto;
+  max-width: 880px;
+  padding: 10px 16px;
+  background: rgba(250, 204, 21, 0.12);
+  border-bottom: 1px solid rgba(250, 204, 21, 0.4);
+  color: #fde68a;
+  font-size: 0.88rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  backdrop-filter: blur(6px);
+}
+.keepalive-icon { font-size: 1.1rem; flex-shrink: 0; }
+.keepalive-text strong { color: #fef3c7; }
+
 /* ---------- Error ---------- */
 .error-box {
   margin-top: 16px;

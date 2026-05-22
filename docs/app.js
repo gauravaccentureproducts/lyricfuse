@@ -25,14 +25,16 @@ env.useBrowserCache = true;
 
 // ----- single-threaded FFmpeg core: no SharedArrayBuffer needed -----
 // (Slower than the multi-threaded core, but works on GitHub Pages without
-// custom COOP/COEP headers. The coi-serviceworker is preloaded so we *could*
-// upgrade to @ffmpeg/core-mt later for a speed boost.)
+// custom COOP/COEP headers.)
 const FFMPEG_CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
 
-// The @ffmpeg/ffmpeg package spawns a Web Worker that wraps the WASM core.
-// Browsers refuse to construct a classic Worker from a cross-origin script,
-// so we must fetch worker.js and rehost it as a same-origin Blob URL.
-const FFMPEG_PKG_BASE = "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm";
+// The @ffmpeg/ffmpeg main thread instantiates a module Worker (worker.js).
+// That Worker can't be loaded cross-origin AND it imports ./const.js and
+// ./errors.js by relative path — which a Blob URL can't resolve either.
+// Solution: self-host worker.js + its two siblings under docs/ffmpeg/ so
+// they all live at the same same-origin directory. Version MUST stay in
+// lockstep with the @ffmpeg/ffmpeg ESM import URL (0.12.10).
+const LOCAL_FFMPEG_WORKER = "ffmpeg/worker.js";  // resolved against window.location at runtime
 
 // ----- Whisper model choice -----
 // 'Xenova/whisper-base' is the multilingual base model (~75 MB).
@@ -231,12 +233,18 @@ async function getFFmpeg(onProgress) {
     if (onProgress) onProgress(progress);
   });
 
-  // Note: workerURL MUST be a same-origin Blob URL, not the raw unpkg URL —
-  // browsers block cross-origin classic Worker construction with SecurityError.
+  // The correct parameter for the wrapper Worker is `classWorkerURL`, NOT
+  // `workerURL`. `workerURL` is only for the *core* multi-threaded worker
+  // (which we don't use). FFmpeg.load resolves classWorkerURL via
+  // `new URL(value, import.meta.url)` — `import.meta.url` is unpkg, so a
+  // relative path like "ffmpeg/worker.js" would resolve to unpkg's domain.
+  // We therefore build an *absolute* same-origin URL ourselves.
+  const classWorkerURL = new URL(LOCAL_FFMPEG_WORKER, window.location.href).toString();
+
   await ffmpeg.load({
-    coreURL:   await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`,   "text/javascript"),
-    wasmURL:   await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-    workerURL: await toBlobURL(`${FFMPEG_PKG_BASE}/worker.js`,         "text/javascript"),
+    coreURL:        await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`,   "text/javascript"),
+    wasmURL:        await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+    classWorkerURL,
   });
   state.ffmpeg = ffmpeg;
   return ffmpeg;

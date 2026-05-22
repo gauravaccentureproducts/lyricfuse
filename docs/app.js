@@ -29,6 +29,11 @@ env.useBrowserCache = true;
 // upgrade to @ffmpeg/core-mt later for a speed boost.)
 const FFMPEG_CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
 
+// The @ffmpeg/ffmpeg package spawns a Web Worker that wraps the WASM core.
+// Browsers refuse to construct a classic Worker from a cross-origin script,
+// so we must fetch worker.js and rehost it as a same-origin Blob URL.
+const FFMPEG_PKG_BASE = "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm";
+
 // ----- Whisper model choice -----
 // 'Xenova/whisper-base' is the multilingual base model (~75 MB).
 // 'tiny' is faster but markedly worse for Hindi/Punjabi. 'small' is better
@@ -226,9 +231,12 @@ async function getFFmpeg(onProgress) {
     if (onProgress) onProgress(progress);
   });
 
+  // Note: workerURL MUST be a same-origin Blob URL, not the raw unpkg URL —
+  // browsers block cross-origin classic Worker construction with SecurityError.
   await ffmpeg.load({
-    coreURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-    wasmURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+    coreURL:   await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`,   "text/javascript"),
+    wasmURL:   await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+    workerURL: await toBlobURL(`${FFMPEG_PKG_BASE}/worker.js`,         "text/javascript"),
   });
   state.ffmpeg = ffmpeg;
   return ffmpeg;

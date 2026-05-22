@@ -113,10 +113,23 @@ function clearError() {
   els.errorBox.textContent = "";
 }
 
-function showError(msg) {
+function showError(msgOrErr) {
   els.errorBox.classList.remove("hidden");
-  els.errorBox.textContent = msg;
-  console.error("[LyricFuse]", msg);
+  let text;
+  if (msgOrErr && typeof msgOrErr === "object") {
+    // Surface the FULL technical detail so we can debug from the UI alone
+    // without forcing the user to open DevTools.
+    const parts = [];
+    if (msgOrErr.name) parts.push(msgOrErr.name);
+    if (msgOrErr.message) parts.push(msgOrErr.message);
+    if (msgOrErr.cause)   parts.push("cause: " + (msgOrErr.cause.message || msgOrErr.cause));
+    if (msgOrErr.stack)   parts.push("\n--- stack ---\n" + msgOrErr.stack);
+    text = parts.join(" — ");
+  } else {
+    text = String(msgOrErr);
+  }
+  els.errorBox.textContent = text;
+  console.error("[LyricFuse]", msgOrErr);
 }
 
 function updateAnalyzeButton() {
@@ -266,19 +279,52 @@ async function extractAudio(ffmpeg, videoBytes) {
 
 // ===================================================================
 // Step 2: decode WAV bytes -> Float32Array (mono, 16 kHz) for Whisper
+//
+// Why this is non-trivial:
+//   - `new AudioContext({ sampleRate: 16000 })` throws/ignores on Safari and
+//     some mobile Chrome versions, silently falling back to 44.1/48 kHz.
+//   - If we hand non-16 kHz audio to Whisper, it misinterprets duration and
+//     produces garbage word timestamps (or hangs).
+//   - Solution: decode at the context's native rate, then explicitly resample
+//     to 16 kHz mono using an OfflineAudioContext (which always honors its
+//     target sample rate).
 // ===================================================================
 async function decodeWavToFloat32(wavBytes) {
-  // Use the browser's AudioContext to decode; Whisper expects mono 16 kHz Float32.
-  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-  const arrayBuffer = wavBytes.buffer.slice(
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) throw new Error("This browser does not support the Web Audio API.");
+  const ctx = new AC();
+
+  // decodeAudioData wants a real ArrayBuffer slice (not a SharedArrayBuffer view).
+  const ab = wavBytes.buffer.slice(
     wavBytes.byteOffset,
     wavBytes.byteOffset + wavBytes.byteLength
   );
-  const decoded = await ctx.decodeAudioData(arrayBuffer);
-  const channel = decoded.getChannelData(0); // mono assumed
-  // ctx.sampleRate may not exactly match the WAV's rate on some browsers, but
-  // AudioContext resamples on decode, so we should get 16 kHz Float32 out.
-  return channel;
+
+  let decoded;
+  try {
+    decoded = await ctx.decodeAudioData(ab);
+  } catch (e) {
+    throw new Error("Could not decode the extracted WAV audio. " + (e.message || e));
+  } finally {
+    if (ctx.close) ctx.close().catch(() => {});
+  }
+
+  // Fast path: already exactly what Whisper wants.
+  if (decoded.sampleRate === 16000 && decoded.numberOfChannels === 1) {
+    return decoded.getChannelData(0);
+  }
+
+  // Resample to 16 kHz mono via OfflineAudioContext (always honors its
+  // declared sampleRate; auto-downmixes when the destination has 1 channel).
+  const targetRate = 16000;
+  const targetLen = Math.max(1, Math.ceil(decoded.duration * targetRate));
+  const offline = new OfflineAudioContext(1, targetLen, targetRate);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start(0);
+  const resampled = await offline.startRendering();
+  return resampled.getChannelData(0);
 }
 
 // ===================================================================
@@ -430,7 +476,12 @@ async function handleAnalyze() {
     populatePreviewTable(timedLines);
     showStage("preview");
   } catch (err) {
-    showError(`Analysis failed: ${err.message || err}`);
+    // Wrap with our prefix but pass the original error so showError
+    // can render the full stack/cause chain.
+    const wrapped = new Error("Analysis failed — " + (err.message || err));
+    wrapped.cause = err;
+    wrapped.stack = err.stack;
+    showError(wrapped);
     els.btnAnalyze.disabled = false;
   }
 }
@@ -483,7 +534,10 @@ async function handleGenerate() {
 
     showStage("done");
   } catch (err) {
-    showError(`Subtitle burn failed: ${err.message || err}`);
+    const wrapped = new Error("Subtitle burn failed — " + (err.message || err));
+    wrapped.cause = err;
+    wrapped.stack = err.stack;
+    showError(wrapped);
     els.btnGenerate.disabled = false;
   }
 }

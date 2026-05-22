@@ -237,7 +237,12 @@ textarea:focus, select:focus { outline: none; border-color: var(--primary); }
   border: 1px solid var(--error);
   border-radius: var(--radius-sm);
   color: var(--error);
-  font-size: 0.9rem;
+  font-size: 0.82rem;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow-y: auto;
 }
 
 /* ---------- Table (preview) ---------- */

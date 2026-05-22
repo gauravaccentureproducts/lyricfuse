@@ -78,6 +78,7 @@ const els = {
   btnAnalyze: $("btn-analyze"),
   progressArea: $("progress-area"),
   progressFill: $("progress-fill"),
+  progressPct: $("progress-pct"),
   progressStatus: $("progress-status"),
   errorBox: $("error-box"),
 
@@ -89,6 +90,7 @@ const els = {
   btnRestartFromPreview: $("btn-restart-from-preview"),
   burnProgressArea: $("burn-progress-area"),
   burnProgressFill: $("burn-progress-fill"),
+  burnProgressPct: $("burn-progress-pct"),
   burnProgressStatus: $("burn-progress-status"),
 
   // Stage 3
@@ -109,10 +111,40 @@ function showStage(stage) {
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
-function setProgress(area, fill, status, pct, message) {
-  area.classList.remove("hidden");
-  fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-  status.textContent = message;
+/*
+ * Build a single closure that bundles all four DOM nodes for one progress UI
+ * (bar area, fill, percent label, status text). Returns a function the
+ * pipeline calls as `progress(pct, message)`. Passing `null`/undefined for
+ * `message` leaves the existing status text alone — useful for the
+ * sub-second updates coming from ffmpeg's progress event or whisper's
+ * chunk callback where the verb hasn't changed.
+ */
+function makeProgressUpdater(area, fill, pctEl, statusEl) {
+  let lastMessage = "";
+  return function progress(pct, message) {
+    area.classList.remove("hidden");
+    const clamped = Math.max(0, Math.min(100, pct));
+    fill.style.width = `${clamped}%`;
+    pctEl.textContent = `${Math.floor(clamped)}%`;
+    if (message != null && message !== lastMessage) {
+      statusEl.textContent = message;
+      lastMessage = message;
+    }
+  };
+}
+
+/*
+ * Maps a sub-step's [0..1] internal progress onto a slice of the overall
+ * progress bar [from..to]. Lets each pipeline step report 0..1 of itself
+ * without knowing where it lives in the global timeline.
+ */
+function makeSubProgress(progress, from, to, label) {
+  const span = to - from;
+  return function (frac, sublabel) {
+    const pct = from + Math.max(0, Math.min(1, frac)) * span;
+    const msg = sublabel ? `${label} — ${sublabel}` : label;
+    progress(pct, msg);
+  };
 }
 
 function clearError() {
@@ -223,29 +255,31 @@ function handleVideoSelected(file) {
 
 // ===================================================================
 // FFmpeg lazy loader
+//
+// Loading is genuinely three serial fetches (core JS, core WASM, wrapper
+// worker JS) plus an initialization handshake. We report each as a slice
+// of [0..1] so the caller can map them onto the overall bar.
 // ===================================================================
-async function getFFmpeg(onProgress) {
-  if (state.ffmpeg && state.ffmpeg.loaded) return state.ffmpeg;
+async function getFFmpeg(subProgress) {
+  if (state.ffmpeg && state.ffmpeg.loaded) {
+    if (subProgress) subProgress(1.0, "already loaded");
+    return state.ffmpeg;
+  }
 
   const ffmpeg = new FFmpeg();
   ffmpeg.on("log", ({ message }) => console.debug("[ffmpeg]", message));
-  ffmpeg.on("progress", ({ progress }) => {
-    if (onProgress) onProgress(progress);
-  });
 
-  // The correct parameter for the wrapper Worker is `classWorkerURL`, NOT
-  // `workerURL`. `workerURL` is only for the *core* multi-threaded worker
-  // (which we don't use). FFmpeg.load resolves classWorkerURL via
-  // `new URL(value, import.meta.url)` — `import.meta.url` is unpkg, so a
-  // relative path like "ffmpeg/worker.js" would resolve to unpkg's domain.
-  // We therefore build an *absolute* same-origin URL ourselves.
+  if (subProgress) subProgress(0.0, "fetching core script");
+  const coreURL = await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, "text/javascript");
+  if (subProgress) subProgress(0.4, "fetching WASM (~20 MB)");
+  const wasmURL = await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm");
+  if (subProgress) subProgress(0.85, "fetching worker");
   const classWorkerURL = new URL(LOCAL_FFMPEG_WORKER, window.location.href).toString();
 
-  await ffmpeg.load({
-    coreURL:        await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`,   "text/javascript"),
-    wasmURL:        await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-    classWorkerURL,
-  });
+  if (subProgress) subProgress(0.92, "initializing engine");
+  await ffmpeg.load({ coreURL, wasmURL, classWorkerURL });
+  if (subProgress) subProgress(1.0, "ready");
+
   state.ffmpeg = ffmpeg;
   return ffmpeg;
 }
@@ -253,43 +287,82 @@ async function getFFmpeg(onProgress) {
 // ===================================================================
 // Whisper lazy loader (per language)
 // ===================================================================
-async function getTranscriber(language, onProgress) {
+async function getTranscriber(language, subProgress) {
   // Sanskrit falls back to Hindi (Whisper has very limited 'sa' data).
   const effectiveLang = language === "sa" ? "hi" : language;
 
   if (state.transcriber && state.transcriberLang === effectiveLang) {
+    if (subProgress) subProgress(1.0, "already in memory");
     return state.transcriber;
   }
+  if (subProgress) subProgress(0.0, "starting download");
+
+  // transformers.js fires progress_callback with status 'progress' and
+  // numeric progress 0..100 per file. Multiple files load sequentially —
+  // we track which file is current and surface that to the user.
   state.transcriber = await pipeline(
     "automatic-speech-recognition",
     WHISPER_MODEL,
     {
       progress_callback: (data) => {
-        if (data.status === "progress" && onProgress) {
-          onProgress(data.progress / 100, data.file);
+        if (!subProgress) return;
+        if (data.status === "progress") {
+          const pct = (data.progress || 0) / 100;
+          const mb = data.loaded ? ` (${(data.loaded / 1024 / 1024).toFixed(1)} MB)` : "";
+          subProgress(pct, `${data.file}${mb}`);
+        } else if (data.status === "done") {
+          subProgress(1.0, `${data.file} cached`);
+        } else if (data.status === "ready") {
+          subProgress(1.0, "model ready");
         }
       },
     }
   );
   state.transcriberLang = effectiveLang;
+  if (subProgress) subProgress(1.0, "model ready");
   return state.transcriber;
 }
 
 // ===================================================================
 // Step 1: extract 16 kHz mono WAV from video
+//
+// FFmpeg's `progress` event emits { progress: 0..1, time: us } during exec.
+// We attach a temporary listener for the duration of this call so the bar
+// moves smoothly while ffmpeg is decoding/resampling/encoding the audio.
 // ===================================================================
-async function extractAudio(ffmpeg, videoBytes) {
+async function extractAudio(ffmpeg, videoBytes, subProgress) {
+  if (subProgress) subProgress(0, "writing video to virtual FS");
   await ffmpeg.writeFile("input.mp4", videoBytes);
-  // 16 kHz mono PCM is what Whisper wants.
-  await ffmpeg.exec([
-    "-i", "input.mp4",
-    "-vn",
-    "-acodec", "pcm_s16le",
-    "-ar", "16000",
-    "-ac", "1",
-    "audio.wav",
-  ]);
+
+  // Live progress wiring. We CANNOT use the global onProgress option of
+  // ffmpeg.load() because it would also fire during the later burn step;
+  // instead we attach + detach a listener around this exec.
+  const onFFmpegProgress = ({ progress }) => {
+    if (subProgress && progress >= 0 && progress <= 1) {
+      // Reserve the first 5% for the writeFile, last 5% for readFile.
+      subProgress(0.05 + progress * 0.90, `decoding (${Math.floor(progress * 100)}%)`);
+    }
+  };
+  ffmpeg.on("progress", onFFmpegProgress);
+
+  try {
+    if (subProgress) subProgress(0.05, "starting ffmpeg decode");
+    // 16 kHz mono PCM is what Whisper wants.
+    await ffmpeg.exec([
+      "-i", "input.mp4",
+      "-vn",
+      "-acodec", "pcm_s16le",
+      "-ar", "16000",
+      "-ac", "1",
+      "audio.wav",
+    ]);
+  } finally {
+    ffmpeg.off("progress", onFFmpegProgress);
+  }
+
+  if (subProgress) subProgress(0.95, "reading WAV bytes back");
   const data = await ffmpeg.readFile("audio.wav");
+  if (subProgress) subProgress(1.0, `${(data.byteLength / 1024 / 1024).toFixed(1)} MB extracted`);
   return data; // Uint8Array
 }
 
@@ -305,17 +378,20 @@ async function extractAudio(ffmpeg, videoBytes) {
 //     to 16 kHz mono using an OfflineAudioContext (which always honors its
 //     target sample rate).
 // ===================================================================
-async function decodeWavToFloat32(wavBytes) {
+async function decodeWavToFloat32(wavBytes, subProgress) {
+  if (subProgress) subProgress(0.0, "creating audio context");
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) throw new Error("This browser does not support the Web Audio API.");
   const ctx = new AC();
 
+  if (subProgress) subProgress(0.10, "preparing buffer");
   // decodeAudioData wants a real ArrayBuffer slice (not a SharedArrayBuffer view).
   const ab = wavBytes.buffer.slice(
     wavBytes.byteOffset,
     wavBytes.byteOffset + wavBytes.byteLength
   );
 
+  if (subProgress) subProgress(0.25, "decoding PCM samples");
   let decoded;
   try {
     decoded = await ctx.decodeAudioData(ab);
@@ -327,9 +403,17 @@ async function decodeWavToFloat32(wavBytes) {
 
   // Fast path: already exactly what Whisper wants.
   if (decoded.sampleRate === 16000 && decoded.numberOfChannels === 1) {
+    if (subProgress) subProgress(1.0, `${decoded.duration.toFixed(1)}s ready (native 16 kHz)`);
     return decoded.getChannelData(0);
   }
 
+  if (subProgress) {
+    subProgress(
+      0.55,
+      `resampling ${decoded.sampleRate} Hz → 16000 Hz` +
+      (decoded.numberOfChannels > 1 ? ", downmix to mono" : "")
+    );
+  }
   // Resample to 16 kHz mono via OfflineAudioContext (always honors its
   // declared sampleRate; auto-downmixes when the destination has 1 channel).
   const targetRate = 16000;
@@ -340,20 +424,80 @@ async function decodeWavToFloat32(wavBytes) {
   src.connect(offline.destination);
   src.start(0);
   const resampled = await offline.startRendering();
+  if (subProgress) subProgress(1.0, `${decoded.duration.toFixed(1)}s ready`);
   return resampled.getChannelData(0);
 }
 
 // ===================================================================
 // Step 3: transcribe with word timestamps
+//
+// Transcription is the slowest pipeline step (often 30s-5min on mobile).
+// Two complementary progress sources keep the bar moving:
+//
+//   1. transformers.js fires `chunk_callback(chunk)` after each 30-second
+//      window completes. Total chunks ≈ ceil(audio_seconds / stride_window).
+//   2. As a safety net, a 1 Hz wall-clock ticker advances the bar by a
+//      small fraction per second so users see life even if chunk_callback
+//      stalls (which can happen when the model is loading internal weights
+//      lazily on the first chunk).
 // ===================================================================
-async function transcribeWithWordTimestamps(transcriber, float32Audio, language) {
-  const result = await transcriber(float32Audio, {
-    return_timestamps: "word",
-    language,
-    task: "transcribe",
-    chunk_length_s: 30,
-    stride_length_s: 5,
-  });
+const CHUNK_LENGTH_S = 30;
+const STRIDE_LENGTH_S = 5;
+
+async function transcribeWithWordTimestamps(transcriber, float32Audio, language, subProgress) {
+  const audioSeconds = float32Audio.length / 16000;
+  // Stride between successive chunks; matches transformers.js's internal math.
+  const effectiveStride = CHUNK_LENGTH_S - STRIDE_LENGTH_S;
+  const totalChunks = Math.max(1, Math.ceil(audioSeconds / effectiveStride));
+
+  let chunksDone = 0;
+  const started = performance.now();
+
+  if (subProgress) {
+    subProgress(0.0, `0 / ${totalChunks} chunks (audio is ${audioSeconds.toFixed(1)}s)`);
+  }
+
+  // Safety-net ticker: even if chunk_callback never fires, advance the bar
+  // toward — but never past — the next chunk boundary, based on a rough
+  // estimate (mobile WASM Whisper ≈ 20s real time per 30s chunk).
+  const ESTIMATED_SECONDS_PER_CHUNK = 20;
+  const ticker = setInterval(() => {
+    if (!subProgress) return;
+    const elapsedS = (performance.now() - started) / 1000;
+    const estChunks = Math.min(elapsedS / ESTIMATED_SECONDS_PER_CHUNK, totalChunks);
+    // Only step forward if the wall-clock estimate is ahead of chunksDone.
+    const frac = Math.max(chunksDone, estChunks) / totalChunks;
+    subProgress(
+      Math.min(0.97, frac),
+      `${chunksDone} / ${totalChunks} chunks · ${Math.floor(elapsedS)}s elapsed`
+    );
+  }, 1000);
+
+  let result;
+  try {
+    result = await transcriber(float32Audio, {
+      return_timestamps: "word",
+      language,
+      task: "transcribe",
+      chunk_length_s: CHUNK_LENGTH_S,
+      stride_length_s: STRIDE_LENGTH_S,
+      chunk_callback: (chunk) => {
+        chunksDone += 1;
+        if (subProgress) {
+          const elapsedS = (performance.now() - started) / 1000;
+          subProgress(
+            chunksDone / totalChunks,
+            `${chunksDone} / ${totalChunks} chunks · ${Math.floor(elapsedS)}s elapsed`
+          );
+        }
+      },
+    });
+  } finally {
+    clearInterval(ticker);
+  }
+
+  if (subProgress) subProgress(1.0, `transcribed (${(result.chunks || []).length} words)`);
+
   // result.chunks = [{ text, timestamp: [start, end] }, ...]
   return (result.chunks || [])
     .filter((c) => c.timestamp && c.timestamp[0] != null && c.timestamp[1] != null)
@@ -417,24 +561,46 @@ function generateSRT(timedLines) {
 
 // ===================================================================
 // Step 6: burn subtitles into video (FFmpeg)
+//
+// Same progress pattern as extractAudio: attach a temporary listener for
+// the encode's duration so the bar reflects ffmpeg's own progress events.
 // ===================================================================
-async function burnSubtitles(ffmpeg, videoBytes, srtText) {
+async function burnSubtitles(ffmpeg, videoBytes, srtText, subProgress) {
+  if (subProgress) subProgress(0.0, "writing video to virtual FS");
   await ffmpeg.writeFile("input.mp4", videoBytes);
+  if (subProgress) subProgress(0.05, "writing subtitle file");
   await ffmpeg.writeFile("subs.srt", new TextEncoder().encode(srtText));
 
   const forceStyle =
     "FontName=Arial,FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=40";
 
-  await ffmpeg.exec([
-    "-i", "input.mp4",
-    "-vf", `subtitles=subs.srt:force_style='${forceStyle}'`,
-    "-c:a", "copy",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "22",
-    "output.mp4",
-  ]);
-  return await ffmpeg.readFile("output.mp4");
+  const onFFmpegProgress = ({ progress }) => {
+    if (subProgress && progress >= 0 && progress <= 1) {
+      // Reserve 0-7% for writes, 90-100% for read-back.
+      subProgress(0.07 + progress * 0.83, `encoding (${Math.floor(progress * 100)}%)`);
+    }
+  };
+  ffmpeg.on("progress", onFFmpegProgress);
+
+  try {
+    if (subProgress) subProgress(0.07, "starting encode");
+    await ffmpeg.exec([
+      "-i", "input.mp4",
+      "-vf", `subtitles=subs.srt:force_style='${forceStyle}'`,
+      "-c:a", "copy",
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-crf", "22",
+      "output.mp4",
+    ]);
+  } finally {
+    ffmpeg.off("progress", onFFmpegProgress);
+  }
+
+  if (subProgress) subProgress(0.92, "reading output MP4");
+  const out = await ffmpeg.readFile("output.mp4");
+  if (subProgress) subProgress(1.0, `${(out.byteLength / 1024 / 1024).toFixed(1)} MB ready`);
+  return out;
 }
 
 // ===================================================================
@@ -444,50 +610,70 @@ async function handleAnalyze() {
   clearError();
   els.btnAnalyze.disabled = true;
 
+  // Build a single progress updater bound to the analyze UI nodes, then
+  // carve it into named sub-ranges per pipeline phase. The width of each
+  // range is roughly proportional to how long that phase takes in practice,
+  // so the bar moves at a roughly steady pace from end to end.
+  const progress = makeProgressUpdater(
+    els.progressArea, els.progressFill, els.progressPct, els.progressStatus
+  );
+
+  // Phase ranges (must sum to 100):
+  const R = {
+    read:     [0,   3 ],   //  3 — instant read of the file bytes
+    ffmpeg:   [3,   10],   //  7 — fetching 3 scripts + init
+    extract:  [10,  25],   // 15 — ffmpeg exec, progress events live
+    model:    [25,  48],   // 23 — Whisper model download (first run dominates)
+    decode:   [48,  55],   //  7 — WAV decode + resample
+    asr:      [55,  92],   // 37 — transcription (slowest, chunk_callback live)
+    align:    [92,  96],   //  4 — word-to-line mapping
+    srt:      [96,  100],  //  4 — text gen
+  };
+  const phase = (key, label) =>
+    makeSubProgress(progress, R[key][0], R[key][1], label);
+
   try {
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 2, "Reading video...");
+    const readSub = phase("read", "Reading video file");
+    readSub(0.0, "loading bytes from disk");
     state.videoBytes = new Uint8Array(await state.videoFile.arrayBuffer());
+    readSub(1.0, `${(state.videoBytes.byteLength / 1024 / 1024).toFixed(1)} MB loaded`);
 
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 5,
-      "Loading FFmpeg (first time only, ~25 MB)...");
-    const ffmpeg = await getFFmpeg();
+    const ffmpeg = await getFFmpeg(phase("ffmpeg", "Loading FFmpeg engine"));
 
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 15,
-      "Extracting audio from video...");
-    const wavBytes = await extractAudio(ffmpeg, state.videoBytes);
+    const wavBytes = await extractAudio(
+      ffmpeg, state.videoBytes, phase("extract", "Extracting audio")
+    );
 
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 25,
-      "Loading Whisper model (first time only, ~75 MB)...");
-    const transcriber = await getTranscriber(state.language, (p, file) => {
-      const pct = 25 + Math.floor(p * 25);
-      setProgress(els.progressArea, els.progressFill, els.progressStatus, pct,
-        `Downloading model: ${file} (${Math.floor(p * 100)}%)`);
-    });
+    const transcriber = await getTranscriber(
+      state.language, phase("model", "Loading Whisper model")
+    );
 
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 55,
-      "Decoding audio...");
-    const float32 = await decodeWavToFloat32(wavBytes);
+    const float32 = await decodeWavToFloat32(wavBytes, phase("decode", "Decoding audio"));
 
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 60,
-      "Transcribing with Whisper (this is the slow part — be patient)...");
     const lang = state.language === "sa" ? "hi" : state.language;
-    const words = await transcribeWithWordTimestamps(transcriber, float32, lang);
+    const words = await transcribeWithWordTimestamps(
+      transcriber, float32, lang, phase("asr", "Transcribing audio")
+    );
 
     if (words.length === 0) {
       throw new Error("Whisper produced no word timestamps. Audio may be silent or in an unsupported language.");
     }
 
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 92,
-      "Mapping words to your lyric lines...");
+    const alignSub = phase("align", "Aligning lyric lines");
+    alignSub(0.5, `${words.length} words → your lyric structure`);
     const timedLines = groupWordsToLines(words, state.lyricsText);
     if (timedLines.length === 0) {
       throw new Error("Could not align any lyric lines.");
     }
+    alignSub(1.0, `${timedLines.length} lines aligned`);
     state.timedLines = timedLines;
-    state.srtText = generateSRT(timedLines);
 
-    setProgress(els.progressArea, els.progressFill, els.progressStatus, 100,
-      `Done — ${timedLines.length} lines aligned.`);
+    const srtSub = phase("srt", "Generating SRT");
+    srtSub(0.5, "encoding timestamps");
+    state.srtText = generateSRT(timedLines);
+    srtSub(1.0, `${timedLines.length} cues ready`);
+
+    progress(100, `Done — ${timedLines.length} lines aligned`);
 
     populatePreviewTable(timedLines);
     showStage("preview");
@@ -527,13 +713,26 @@ function escapeHtml(s) {
 
 async function handleGenerate() {
   els.btnGenerate.disabled = true;
-  try {
-    setProgress(els.burnProgressArea, els.burnProgressFill, els.burnProgressStatus, 10,
-      "Burning subtitles onto video...");
-    const ffmpeg = await getFFmpeg();
-    const outBytes = await burnSubtitles(ffmpeg, state.videoBytes, state.srtText);
+  const progress = makeProgressUpdater(
+    els.burnProgressArea, els.burnProgressFill, els.burnProgressPct, els.burnProgressStatus
+  );
 
-    setProgress(els.burnProgressArea, els.burnProgressFill, els.burnProgressStatus, 100, "Done!");
+  // FFmpeg should already be loaded from the analyze step (cached on state),
+  // so its phase is normally a quick "already loaded" — but we leave a small
+  // budget in case the user refreshed between analyze and generate.
+  const R = {
+    ffmpeg: [0,   5  ],
+    burn:   [5,   100],
+  };
+  const phase = (k, label) => makeSubProgress(progress, R[k][0], R[k][1], label);
+
+  try {
+    const ffmpeg = await getFFmpeg(phase("ffmpeg", "Loading FFmpeg engine"));
+    const outBytes = await burnSubtitles(
+      ffmpeg, state.videoBytes, state.srtText, phase("burn", "Burning subtitles into video")
+    );
+
+    progress(100, "Done — your subtitled video is ready");
 
     const blob = new Blob([outBytes.buffer], { type: "video/mp4" });
     state.outputBlob = blob;

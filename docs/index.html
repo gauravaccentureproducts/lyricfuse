@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LyricFuse — Burn lyrics onto any video</title>
+  <meta name="description" content="Browser-only forced-alignment tool: drop a video, paste lyrics, get a video with subtitles burned in. 100% client-side." />
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Cross-origin isolation polyfill (required for SharedArrayBuffer / ffmpeg.wasm on GitHub Pages) -->
+  <script src="coi-serviceworker.js"></script>
+</head>
+<body>
+  <header class="hero">
+    <h1>🎵 LyricFuse</h1>
+    <p class="tagline">Fuse lyrics onto a video — exactly on time, line by line.</p>
+    <p class="subtitle">Runs entirely in your browser. Nothing uploaded to any server.</p>
+  </header>
+
+  <main>
+    <!-- ================================================================ -->
+    <!-- STAGE 1: INPUT                                                    -->
+    <!-- ================================================================ -->
+    <section id="stage-input" class="stage active">
+
+      <div class="card">
+        <h2>1. Upload video</h2>
+        <label for="video-input" id="drop-zone" class="drop-zone">
+          <div class="drop-icon">📹</div>
+          <p class="drop-text">Drag &amp; drop MP4 here</p>
+          <p class="drop-hint">or click to browse</p>
+          <p id="video-filename" class="filename hidden"></p>
+          <input type="file" id="video-input" accept="video/mp4" hidden />
+        </label>
+      </div>
+
+      <div class="card">
+        <h2>2. Provide lyrics</h2>
+        <div class="tab-group">
+          <button type="button" class="tab-btn active" data-tab="paste">Paste text</button>
+          <button type="button" class="tab-btn" data-tab="upload">Upload .txt</button>
+        </div>
+        <div id="tab-paste" class="tab-content active">
+          <textarea
+            id="lyrics-text"
+            placeholder="First line of the song&#10;Second line of the song&#10;..."
+            rows="8"
+          ></textarea>
+        </div>
+        <div id="tab-upload" class="tab-content">
+          <label for="lyrics-file" class="upload-btn-label">
+            <span>📄 Choose .txt file</span>
+            <input type="file" id="lyrics-file" accept=".txt,text/plain" hidden />
+          </label>
+          <pre id="lyrics-file-preview" class="file-preview hidden"></pre>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>3. Language</h2>
+        <select id="language-select">
+          <option value="en">English</option>
+          <option value="hi">Hindi</option>
+          <option value="pa">Punjabi</option>
+          <option value="sa">Sanskrit (uses Hindi model — accuracy may vary)</option>
+        </select>
+      </div>
+
+      <button id="btn-analyze" class="btn btn-primary" disabled>
+        🎯 Analyze &amp; Preview
+      </button>
+
+      <div id="progress-area" class="progress-area hidden">
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <p id="progress-status" class="progress-status"></p>
+      </div>
+
+      <div id="error-box" class="error-box hidden"></div>
+    </section>
+
+    <!-- ================================================================ -->
+    <!-- STAGE 2: PREVIEW                                                  -->
+    <!-- ================================================================ -->
+    <section id="stage-preview" class="stage">
+      <div class="card">
+        <h2>🔍 Preview — subtitle timings</h2>
+        <p id="preview-count" class="muted"></p>
+        <div class="table-wrap">
+          <table id="preview-table">
+            <thead>
+              <tr><th>#</th><th>Start</th><th>End</th><th>Line</th></tr>
+            </thead>
+            <tbody id="preview-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btn-generate" class="btn btn-primary">🎬 Generate Final Video</button>
+        <button id="btn-restart-from-preview" class="btn btn-secondary">🔄 Start Over</button>
+      </div>
+
+      <div id="burn-progress-area" class="progress-area hidden">
+        <div class="progress-bar">
+          <div id="burn-progress-fill" class="progress-fill"></div>
+        </div>
+        <p id="burn-progress-status" class="progress-status"></p>
+      </div>
+    </section>
+
+    <!-- ================================================================ -->
+    <!-- STAGE 3: DONE                                                     -->
+    <!-- ================================================================ -->
+    <section id="stage-done" class="stage">
+      <div class="card success-card">
+        <h2>🎉 Your lyric video is ready</h2>
+        <video id="result-video" controls></video>
+        <div class="download-row">
+          <a id="dl-video" class="btn btn-primary" download>⬇️ Download lyric video</a>
+          <a id="dl-srt" class="btn btn-secondary" download>📄 Download SRT (verification)</a>
+        </div>
+      </div>
+      <button id="btn-restart" class="btn btn-secondary">🔄 Make another</button>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      Open source — <a href="https://github.com/gauravaccentureproducts/LyricFuse" target="_blank" rel="noopener">view on GitHub</a>.
+      Powered by <code>ffmpeg.wasm</code> + <code>transformers.js</code> Whisper.
+    </p>
+  </footer>
+
+  <!-- Main app logic (module so it can use ES imports for transformers.js / ffmpeg) -->
+  <script type="module" src="app.js"></script>
+</body>
+</html>

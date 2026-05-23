@@ -244,6 +244,26 @@ textarea:focus, select:focus { outline: none; border-color: var(--primary); }
   text-align: left;
 }
 
+/* ---------- Trim test option ---------- */
+.trim-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  margin: 12px 0;
+  background: rgba(108, 140, 255, 0.06);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.trim-option input[type="checkbox"] {
+  margin-top: 2px;
+  flex-shrink: 0;
+  accent-color: var(--primary);
+}
+
 /* ---------- Keepalive banner (during processing) ---------- */
 .keepalive-banner {
   position: sticky;

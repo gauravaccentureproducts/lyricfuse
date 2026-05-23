@@ -78,6 +78,7 @@ const els = {
   lyricsFile: $("lyrics-file"),
   lyricsFilePreview: $("lyrics-file-preview"),
   languageSelect: $("language-select"),
+  trimToggle: $("trim-toggle"),
   btnAnalyze: $("btn-analyze"),
   progressArea: $("progress-area"),
   progressFill: $("progress-fill"),
@@ -422,27 +423,34 @@ async function getTranscriber(language, subProgress) {
 // FFmpeg's `progress` event emits { progress: 0..1, time: us } during exec.
 // We attach a temporary listener for the duration of this call so the bar
 // moves smoothly while ffmpeg is decoding/resampling/encoding the audio.
+//
+// trimSeconds (optional): if set, `-t <n>` caps the extracted audio at the
+// first N seconds. Useful as a diagnostic for users who hit memory issues
+// on long videos — extract 30-60 s, prove the pipeline works end-to-end,
+// then take the trim toggle off for the real run.
 // ===================================================================
-async function extractAudio(ffmpeg, videoBytes, subProgress) {
+async function extractAudio(ffmpeg, videoBytes, subProgress, trimSeconds) {
   if (subProgress) subProgress(0, "writing video to virtual FS");
   await ffmpeg.writeFile("input.mp4", videoBytes);
 
-  // Live progress wiring. We CANNOT use the global onProgress option of
-  // ffmpeg.load() because it would also fire during the later burn step;
-  // instead we attach + detach a listener around this exec.
   const onFFmpegProgress = ({ progress }) => {
     if (subProgress && progress >= 0 && progress <= 1) {
-      // Reserve the first 5% for the writeFile, last 5% for readFile.
       subProgress(0.05 + progress * 0.90, `decoding (${Math.floor(progress * 100)}%)`);
     }
   };
   ffmpeg.on("progress", onFFmpegProgress);
 
   try {
-    if (subProgress) subProgress(0.05, "starting ffmpeg decode");
-    // 16 kHz mono PCM is what Whisper wants.
+    const trimArgs = trimSeconds ? ["-t", String(trimSeconds)] : [];
+    if (subProgress) {
+      subProgress(0.05, trimSeconds
+        ? `starting ffmpeg decode (first ${trimSeconds}s only)`
+        : "starting ffmpeg decode");
+    }
+    console.info("[extractAudio] running ffmpeg with trim =", trimSeconds || "off");
     await ffmpeg.exec([
       "-i", "input.mp4",
+      ...trimArgs,
       "-vn",
       "-acodec", "pcm_s16le",
       "-ar", "16000",
@@ -455,8 +463,9 @@ async function extractAudio(ffmpeg, videoBytes, subProgress) {
 
   if (subProgress) subProgress(0.95, "reading WAV bytes back");
   const data = await ffmpeg.readFile("audio.wav");
+  console.info("[extractAudio] WAV size:", data.byteLength, "bytes");
   if (subProgress) subProgress(1.0, `${(data.byteLength / 1024 / 1024).toFixed(1)} MB extracted`);
-  return data; // Uint8Array
+  return data;
 }
 
 // ===================================================================
@@ -516,43 +525,66 @@ async function decodeWavToFloat32(wavBytes, subProgress) {
   // Fast path: 16-bit PCM, mono, 16 kHz — exactly what FFmpeg gave us and
   // exactly what Whisper wants. Convert int16 -> float32 in [-1, 1].
   //
-  // Earlier version used a chunked DataView.getInt16 loop with setTimeout(0)
-  // yields. On mobile Chrome that read pattern is ~50x slower than a typed
-  // array view AND setTimeout(0) doesn't actually yield reliably under
-  // heavy load — leading to "stuck at X%" symptoms. Replaced with an
-  // Int16Array view (zero-copy when aligned, single 1-pass copy otherwise)
-  // and a single Float32Array.set conversion. For an hour of audio this
-  // completes in ~150 ms, so per-sample progress reporting is unnecessary.
+  // History of this loop:
+  //   v1: DataView.getInt16 per sample → ~50x slower than typed arrays.
+  //   v2: Int16Array view + single tight for-loop → fast (~150 ms / hour
+  //       of audio) but runs synchronously, so the UI sits frozen at the
+  //       "converting" label for the entire conversion. On mobile users
+  //       described this as "stuck at 50%".
+  //   v3 (this): Int16Array view + chunked loop that actually yields to
+  //       the UI thread between chunks, so the bar moves continuously.
+  //       Yield uses requestAnimationFrame which is the most reliable
+  //       way to ensure paint on mobile (setTimeout(0) is unreliable
+  //       under main-thread load).
   const FORMAT_PCM = 1;
+  console.info("[decodeWav] header:", { audioFormat, numChannels, sampleRate, bitsPerSample, dataSize });
   if (audioFormat === FORMAT_PCM && bitsPerSample === 16 && numChannels === 1 && sampleRate === 16000) {
     const numSamples = (dataSize / 2) | 0;
     if (subProgress) {
-      subProgress(0.4, `converting ${(numSamples / 16000).toFixed(1)}s of audio`);
+      subProgress(0.3, `${(numSamples / 16000).toFixed(1)}s · ${numSamples.toLocaleString()} samples`);
     }
-    // Let the UI paint that label before we hog the main thread.
-    await new Promise((r) => setTimeout(r, 16));
 
+    // Build Int16Array view (zero-copy when aligned).
     const absoluteOffset = wavBytes.byteOffset + dataOffset;
     let int16;
     if (absoluteOffset % 2 === 0) {
-      // Aligned: zero-copy view over the original buffer.
       int16 = new Int16Array(wavBytes.buffer, absoluteOffset, numSamples);
     } else {
-      // Misaligned (rare): copy the PCM payload into an aligned buffer.
       const aligned = new Uint8Array(numSamples * 2);
       aligned.set(new Uint8Array(wavBytes.buffer, absoluteOffset, numSamples * 2));
       int16 = new Int16Array(aligned.buffer);
     }
-    if (subProgress) subProgress(0.7, "scaling to [-1, 1]");
 
     const out = new Float32Array(numSamples);
     const SCALE = 1 / 32768;
-    // Tight typed-array loop. JIT vectorises this on V8 / SpiderMonkey.
-    for (let i = 0; i < numSamples; i++) out[i] = int16[i] * SCALE;
 
-    console.info("[decodeWav] fast path complete:",
-      `${numSamples} samples`, `${(numSamples / 16000).toFixed(1)}s`);
-    if (subProgress) subProgress(1.0, `${(numSamples / 16000).toFixed(1)}s ready`);
+    // Chunked conversion that REALLY yields to the UI. Chunk size ≈ 1 MB
+    // worth of samples (~30 s of audio) — small enough that mobile feels
+    // responsive, large enough that the per-chunk overhead is negligible.
+    const CHUNK = 1 << 19; // 524 288 samples ≈ 32 s of 16 kHz
+    let i = 0;
+    const t0 = performance.now();
+    while (i < numSamples) {
+      const end = Math.min(i + CHUNK, numSamples);
+      for (let j = i; j < end; j++) out[j] = int16[j] * SCALE;
+      i = end;
+      if (subProgress) {
+        const frac = 0.3 + 0.7 * (i / numSamples);
+        const sec = (i / 16000).toFixed(0);
+        const totalSec = (numSamples / 16000).toFixed(0);
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+        subProgress(frac, `${sec}s / ${totalSec}s converted · ${elapsed}s elapsed`);
+      }
+      // requestAnimationFrame yields to the next paint — guaranteed to
+      // run the UI repaint before our next chunk. Mobile-reliable.
+      if (i < numSamples) {
+        await new Promise((r) => requestAnimationFrame(() => r()));
+      }
+    }
+
+    const totalMs = (performance.now() - t0).toFixed(0);
+    console.info(`[decodeWav] fast-path done in ${totalMs} ms: ${numSamples} samples (${(numSamples / 16000).toFixed(1)}s)`);
+    if (subProgress) subProgress(1.0, `${(numSamples / 16000).toFixed(1)}s ready (${totalMs} ms)`);
     return out;
   }
 
@@ -811,8 +843,9 @@ async function handleAnalyze() {
 
     const ffmpeg = await getFFmpeg(phase("ffmpeg", "Loading FFmpeg engine"));
 
+    const trimSeconds = els.trimToggle.checked ? 60 : null;
     const wavBytes = await extractAudio(
-      ffmpeg, state.videoBytes, phase("extract", "Extracting audio")
+      ffmpeg, state.videoBytes, phase("extract", "Extracting audio"), trimSeconds
     );
 
     const transcriber = await getTranscriber(

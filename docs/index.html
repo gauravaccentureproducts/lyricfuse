@@ -6,7 +6,7 @@
   <title>LyricFuse — Burn lyrics onto any video</title>
   <meta name="description" content="Browser-only forced-alignment tool: drop a video, paste lyrics, get a video with subtitles burned in. 100% client-side." />
   <!-- Cache-bust on every meaningful change; phones aggressively cache. -->
-  <link rel="stylesheet" href="styles.css?v=20260523e" />
+  <link rel="stylesheet" href="styles.css?v=20260523f" />
   <!-- Note: We use single-threaded ffmpeg.wasm core, so SharedArrayBuffer is
        NOT required. The COI service worker is left in the repo for a future
        upgrade to @ffmpeg/core-mt but is NOT loaded here (it triggers an
@@ -77,6 +77,11 @@
           <option value="sa">Sanskrit (uses Hindi model — accuracy may vary)</option>
         </select>
       </div>
+
+      <label class="trim-option">
+        <input type="checkbox" id="trim-toggle" />
+        <span>Quick test mode — process only the first 60 seconds (diagnostic; faster, useful to confirm the pipeline works end-to-end)</span>
+      </label>
 
       <button id="btn-analyze" class="btn btn-primary" disabled>
         🎯 Analyze &amp; Preview
@@ -153,6 +158,6 @@
 
   <!-- Main app logic (module so it can use ES imports for transformers.js / ffmpeg).
        Cache-bust query: bump this whenever app.js changes substantively. -->
-  <script type="module" src="app.js?v=20260523e"></script>
+  <script type="module" src="app.js?v=20260523f"></script>
 </body>
 </html>
